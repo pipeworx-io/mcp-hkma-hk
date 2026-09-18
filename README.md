@@ -81,3 +81,13 @@ The gateway picks the right tool and fills the arguments automatically.
 ## License
 
 MIT
+
+## No MCP client? Call it over HTTP
+
+```bash
+curl -X POST https://gateway.pipeworx.io/v1/tools/hkma_dataset \
+  -H 'Content-Type: application/json' \
+  -d '{"path":"market-data-and-statistics/daily-monetary-statistics/daily-figures-interbank-liquidity"}'
+```
+
+No account needed for the first calls. Inspect any tool: `GET https://gateway.pipeworx.io/v1/tools/hkma_dataset`. Find one: `POST https://gateway.pipeworx.io/v1/tools/search_packs` with `{"query":"..."}`.
