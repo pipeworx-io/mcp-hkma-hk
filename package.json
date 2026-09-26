@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-hkma-hk",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Hong Kong Monetary Authority (HKMA) public open API MCP. Keyless.",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-5ae66f1e52d8cbd8dffb9908b8f19938e0c2591caa33c03f3fd38425de87d950",
-    "sourceCommit": "70cd53748fc9f9a43ed3681d751bfa96e701efd2"
+    "sourceHash": "v1-4443e47e9bc082bb9c682b4883389bd9b8293a1ce25b44f103e806f22b5e1ed0",
+    "sourceCommit": "1064560fd9dcd0d6fc2606298c2ba244b3a1fbeb"
   }
 }
