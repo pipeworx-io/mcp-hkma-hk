@@ -680,19 +680,87 @@ function collapse(s: string): string {
  * end_of_month as YYYY-MM). Pagination is offset/pagesize; date windows use
  * from/to (YYYY-MM-DD). lang is en|tc|sc and is required by a few datasets
  * (e.g. coin-cart-schedule).
+ *
+ * EGRESS: every call goes through the Pipeworx egress relay when the gateway
+ * injects `_proxyUrl`/`_proxyToken` for this slug. api.hkma.gov.hk is fronted
+ * by an Alibaba Cloud WAF that answers Cloudflare Worker egress with a zh-cn
+ * "405" HTML block page on every request — 79 errors and zero successes
+ * 2026-09-25..10-14, i.e. the whole pack dark — while the relay's address gets
+ * real JSON. See the comment on the error path below for the measured shape of
+ * the WAF's per-IP request budget, and supabase/functions/egress-proxy for the
+ * allow-list entry (fleet #3068).
  */
 
+
+const BASE = 'https://api.hkma.gov.hk/public';
+const UA = 'pipeworx-mcp-hkma-hk/1.0 (+https://pipeworx.io)';
+const UPSTREAM = 'Hong Kong Monetary Authority';
+// HKMA's WAF does read Accept — it is an API that serves JSON — so this is sent
+// explicitly on BOTH paths rather than leaning on the relay's default, so direct
+// dev and the relay behave identically instead of one working by accident.
+const ACCEPT = 'application/json';
+
+/** `_proxyUrl`/`_proxyToken`, injected by the gateway for this slug exactly as
+ *  for kalshi/oklahoma-code/new-hampshire-code — see workers/gateway/src/index.ts.
+ *  Absent (local dev, a published standalone copy, or a gateway build predating
+ *  fleet #3068) falls back to a direct fetch, which still works from an address
+ *  HKMA's WAF has not spent — but NOT from Cloudflare, which is why this exists. */
+type Relay = { url: string; token: string } | null;
+
+function relayFrom(args: Record<string, unknown>): Relay {
+  const url = (args._proxyUrl as string | undefined)?.trim();
+  const token = (args._proxyToken as string | undefined)?.trim();
+  return url && token ? { url, token } : null;
+}
 
 // Bound every fetch() in this pack to a fixed timeout — an upstream that
 // degrades without erroring would otherwise hold the Worker in `await fetch()`
 // until its own execution budget kills the request (minutes, not seconds).
 // Mirrors the epoFetch / usaspending retryFetch pattern (fleet #685).
-async function pwFetch(url: string | URL, init?: RequestInit): Promise<Response> {
-  return fetchWithTimeout(url, init ?? {}, 'Hong Kong Monetary Authority');
+async function pwFetch(url: string | URL, relay: Relay): Promise<Response> {
+  if (relay) {
+    // The relay forwards the target verbatim and hands back the upstream's
+    // status and bytes unchanged. userAgent/accept must be passed explicitly —
+    // it strips caller headers by design.
+    return fetchWithTimeout(
+      relay.url,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${relay.token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: String(url), userAgent: UA, accept: ACCEPT }),
+      },
+      `${UPSTREAM} via the Pipeworx egress relay`,
+    );
+  }
+  return fetchWithTimeout(url, { headers: { 'User-Agent': UA, Accept: ACCEPT } }, UPSTREAM);
 }
 
-const BASE = 'https://api.hkma.gov.hk/public';
-const UA = 'pipeworx-mcp-hkma-hk/1.0 (+https://pipeworx.io)';
+/** The relay synthesizes exactly these `{error}` bodies for a request that never
+ *  reached HKMA at all — a dead bearer token, the host dropped from its
+ *  allow-list. Every one of those is OUR configuration and must book as our own
+ *  outage, never as "HKMA is down" (an allow-list entry that never reached the
+ *  relay took TPEx dark for six hours on 2026-08-20 while returning a
+ *  well-formed 403). `upstream_fetch_failed` is deliberately excluded: that is
+ *  the relay's own fetch failing at the network level, which is a statement
+ *  about HKMA's reachability rather than about our side of the hop. */
+const RELAY_SELF_ERRORS = new Set(['unauthorized', 'bad_request', 'bad_url', 'host_not_allowed', 'method_not_allowed']);
+
+async function relaySelfError(res: Response, relay: Relay): Promise<string | null> {
+  if (!relay || res.ok) return null;
+  let body: unknown;
+  try {
+    body = await res.clone().json();
+  } catch {
+    return null;
+  }
+  const code = (body as { error?: unknown } | null)?.error;
+  if (typeof code !== 'string' || !RELAY_SELF_ERRORS.has(code)) return null;
+  return markInternalOrigin(
+    `Pipeworx egress relay refused the request (${code}) — this is our own relay configuration, not HKMA. See supabase/functions/egress-proxy.`,
+    relay.url,
+    500,
+  );
+}
 
 // Verified-live endpoint paths (the part after /public/).
 const P_INTERBANK_LIQUIDITY =
@@ -803,11 +871,41 @@ async function hkmaGet(path: string, args: Record<string, unknown>): Promise<unk
     if (v != null && String(v).trim() !== '') params.set(key, String(v));
   }
   const qs = params.toString();
-  const res = await pwFetch(`${BASE}/${path}${qs ? `?${qs}` : ''}`, {
-    headers: { Accept: 'application/json', 'User-Agent': UA },
-  });
+  const relay = relayFrom(args);
+  const res = await pwFetch(`${BASE}/${path}${qs ? `?${qs}` : ''}`, relay);
+  const ours = await relaySelfError(res, relay);
+  if (ours) throw new Error(ours);
   const text = await res.text();
-  if (!res.ok) throw new Error(`HKMA: ${res.status} ${text.slice(0, 200)}`);
+  if (!res.ok) {
+    // 2026-10-14: api.hkma.gov.hk sits behind an Alibaba Cloud WAF that answers
+    // with a 405 HTML block page (zh-cn "405" title) instead of JSON. That is
+    // their gate, not our bug — it booked as class=error for 79 rows since
+    // 09-25 and put three tools on the dead-tool sweep. Any non-OK answer whose
+    // body is HTML, or a 403/405/5xx, is an upstream refusal; a real JSON error
+    // from HKMA stays as is.
+    //
+    // WHICH refusal depends on the vantage, and the distinction is measured
+    // (fleet #3068, three rounds from a throwaway function on the relay's own
+    // runtime). The WAF meters a REQUEST BUDGET per source IP — about 3-4 calls,
+    // then everything 405s regardless of path, proven by reversing the probe
+    // order and watching the successes follow the position rather than the URL.
+    // Cloudflare's shared egress is permanently over that budget (79/79), so on
+    // the direct path this really is a wall: upstream_down. The relay's address
+    // carries only our volume and answers real JSON, so a block page THERE means
+    // we momentarily spent its budget, which is a throttle — and
+    // upstream_throttled is the one class the batch runner retries, which is the
+    // correct behaviour for a window that drains in a minute or two. Calling
+    // that "down" would both misreport it and suppress the retry.
+    const looksHtml = /^\s*<!doctype|^\s*<html/i.test(text);
+    if (looksHtml || res.status === 403 || res.status === 405 || res.status >= 500) {
+      const how = looksHtml ? ' with an HTML block page (WAF) instead of JSON' : '';
+      if (relay) {
+        throw new Error(`upstream_throttled: HKMA answered HTTP ${res.status}${how} for /${path}. Their WAF meters roughly 3-4 requests per source IP per window and our relay's budget is momentarily spent; the window drains in about a minute or two, so retry rather than treating this as an outage.`);
+      }
+      throw new Error(`upstream_down: HKMA answered HTTP ${res.status}${how} for /${path}. Their API is reachable from other networks; this is a gateway-egress block on their side.`);
+    }
+    throw new Error(`HKMA: ${res.status} ${text.slice(0, 200)}`);
+  }
   let body: unknown;
   try {
     body = JSON.parse(text);
